@@ -1,0 +1,566 @@
+# -*- coding: utf-8 -*- 
+
+""" 
+This program runs continuously and checks for new loads every 30 seconds.
+It reads new records directly from the Gen.caricamenti table. 
+"""
+
+# import necessary modules and custom parameters
+import sys  
+import os 
+import subprocess 
+import pandas as pd 
+import time 
+import pyodbc  
+from datetime import datetime 
+sys.path.append("G:/progetto_string") 
+import Parametri as P 
+import shutil 
+pj = os.path.join 
+path_programmi = P.path_programmi 
+pathctl = P.path_parametri + 'templates' 
+tmpctl = pj(pathctl, 'Parametri.py') 
+newctl = pj(P.path_parametri, 'Parametri.py') 
+
+# D constant used for time limit 
+D = (((86400*(365*10))*3)*1216)*10000 # maximum number of seconds the program runs (approximately 10 years)
+
+def max_seconds(max_seconds, *, interval=30):
+    """
+    This function yields 0 and then yields the number of seconds passed since it started.
+    It runs until the maximum number of seconds is reached.
+    It uses time.sleep() to wait until the next iteration and returns the number of seconds passed.
+    """
+    interval = int(interval) 
+    start_time = time.time() 
+    end_time = start_time + max_seconds 
+    yield 0 
+    while time.time() < end_time: 
+        if interval > 0: 
+            next_time = start_time 
+            while next_time < time.time(): 
+                next_time += interval 
+            time.sleep(int(round(next_time - time.time()))) 
+        yield int(round(time.time() - start_time)) 
+        if int(round(time.time() + interval)) > int(round(end_time)):  
+            return 
+
+def tabelle_cari(): 
+    """
+    This function updates the 'Data_FinC' field in the 'GEN.Caricamenti' table for the current record.
+    """
+    code = """update GEN.Caricamenti set Data_FinC = '%s' where Nume_Cari = %s""" % (oggi, Nume_Cari) 
+    cursor.execute(code) 
+    conn.commit()  
+    return 
+
+def file_processato(): 
+    """
+    This function copies the file from the 'percorso_completo' path to the 'P.path_processato' path.
+    It then removes the file from the 'percorso_completo' path.
+    """
+    source = percorso_completo
+    destination = P.path_processato 
+    shutil.copy2(source, destination) 
+    os.remove(percorso_completo) 
+
+def aggiorna_parametri(): 
+    """
+    This function updates the 'Parametri.py' file in the 'pathctl' directory with the 'newctl' file.
+    """
+    source = newctl 
+    destination = pathctl 
+    shutil.copy2(source, destination) 
+
+def code_errore(): 
+    """
+    This function updates the 'Esito_caricamento_Genotipi' parameter in the 'Parametri.py' file with the 
+    specified error code and updates the 'pathctl' directory with the new file.
+    """
+    Esito_caricamento_Genotipi = 'D' 
+    out = open(newctl, 'w') 
+    with open(tmpctl, 'r') as f: 
+        for line in f: 
+            if 'Esito_caricamento_Genotipi' in line: 
+                line = "Esito_caricamento_Genotipi = '{Esito_caricamento_Genotipi}'"
+
+#esecuzione
+
+for sec in max_seconds(D, interval=1):
+    #come prima cosa verifico se nella tabella SQL gen.caricamanti ci sono record nuovi
+    print('INICIO LOOP PRINCIPALE  '+str(sec))
+    conn = pyodbc.connect(P.link_connect)
+    cursor = conn.cursor()
+    Gen = P.Folder_Caricamento
+    Controlli_server = 'SELECT Nume_Cari, Data_Cari, Data_FinC, User_Cari, Tipo_cari, Nome_File  FROM GEN.[%s]' % (Gen)
+    table_controlli = pd.read_sql(Controlli_server,conn)
+    #funzione usata in test per metter etutti i carticamanti a new
+    #table_controlli["Data_FinC"]="new" 
+    table_controlli.fillna('new', inplace=True)
+    df_remove = table_controlli.loc[(table_controlli['Data_FinC']!='new')]
+    table_controlli = table_controlli.drop(df_remove.index)
+    #se non ci sono record nuovi rifaccio il cecck dopo interval secondi
+    if table_controlli.empty:
+        print('non ci sono nuovi record')
+        print('ritorno')
+        cursor.close()
+        continue
+    else:
+        print('ci sono nuovi record')       
+        table_controlli.sort_values(by=['Nume_Cari','Data_Cari'],ascending=[True,True],inplace=True) 
+        ids=list(table_controlli['Nume_Cari'])
+        # se ci sono record nuovi processo un record per volta in ordine di data dic aricamanto
+        for id in ids:
+            print('INICIO LOOP SECUNDARIO  '+str(sec))
+            tmp = table_controlli[table_controlli['Nume_Cari']==id].copy()
+            Tipo_cari = list(tmp['Tipo_cari'])
+            Tipo_cari =''.join(map(str,Tipo_cari))
+            Nome_File = list(tmp['Nome_File'])
+            Nome_File =''.join(map(str,Nome_File))
+            date = datetime.today()
+            oggi = date.strftime('%Y-%m-%d')  
+            Nume_Cari = id
+            print(Nume_Cari)
+            #copia il file di paramantri dai templeate nella cartella principale e definisce di che tipo di caricamanto si tratta per questo file
+            out = open(newctl,'w')
+            with open(tmpctl,'r') as f:
+                for line in f:
+                    if 'Tipo_cari' in line:
+                        line = "Tipo_cari = '{Tipo_cari}' # Identificatore da usare su programma log cariamento\n".format(Tipo_cari = Tipo_cari)
+                    if 'Nume_Cari' in line:
+                        line = "Nume_Cari = '{Nume_Cari}' # File mappa da usare in programma genotipi mappa\n".format(Nume_Cari = Nume_Cari)
+                    if 'oggi' in line:
+                        line = "oggi = '{oggi}' # File mappa da usare in programma genotipi mappa\n".format(oggi = oggi)
+                    out.write(line)
+            out.close()
+            aggiorna_parametri()
+            if Tipo_cari == 'M':
+                # verifico la presenza del file con il nome previsto nella cartela
+                for mappe_file in os.listdir(P.path_tmp):
+                    if Nome_File in mappe_file:
+                        break
+                    else:
+                        mappe_file = ''
+                if mappe_file == '':
+                    print('Errore, Mappa non trovata!')
+                    Esito_caricamento_Mappa='D'
+                    out = open(newctl,'w')
+                    with open(tmpctl,'r') as f:
+                        for line in f:
+                            if 'Esito_caricamento_Mappa' in line:
+                                line = "Esito_caricamento_Mappa = '{Esito_caricamento_Mappa}' # Codice per esiti di caricamento log\n".format(Esito_caricamento_Mappa = Esito_caricamento_Mappa)
+                            out.write(line)
+                    out.close()
+                    aggiorna_parametri()
+                    tabelle_cari()
+                else:
+                    print('Mappa trovata!')
+                    Id_mappa = id
+                    print('giro_mappe')
+                    out = open(newctl,'w')
+                    # se il file è presente mando in esecuzione in programma 
+                    with open(tmpctl,'r') as f:
+                        for line in f:
+                            if 'Nome_Map' in line:
+                                line = "Nome_Mapa = '{Nome_File}' # File mappa da usare in programma genotipi mappa\n".format(Nome_File = Nome_File)
+                            if 'Id_mappa' in line:
+                                line = "Id_mappa = '{Id_mappa}' # Identificatore da usare su programma mappa\n".format(Id_mappa = Id_mappa)
+                            out.write(line)
+                    out.close()
+                    aggiorna_parametri()
+                    for geno_mappe in range(1):
+                        print('inizio-programma_genotipi_mappa.py')
+                        script = 'programma_genotipi_mappa.py'
+                        processos = []
+                        processo = subprocess.Popen([sys.executable, script])
+                        processo.wait() 
+                    print('finito processo mappe')
+                    tabelle_cari()
+            else:
+                #entro qui se si tratta di caricare il genotipipo
+                print('giro_genotipi')
+                file_ricerca=Nome_File
+                #verifico la presenza e l'accessibilità al file
+                for finalrep in os.listdir(P.path_tmp):
+                    if Nome_File in finalrep:
+                        percorso_completo = []
+                        for raiz, diretorios, files in os.walk(P.path_tmp):
+                            for file in files:
+                                if file_ricerca in file:
+                                    try:
+                                        percorso_completo = os.path.join(raiz,file)
+                                        nome_file, ext_file = os.path.splitext(file)
+                                        dimensione=os.path.getsize(percorso_completo)
+                                    except PermissionError as e:
+                                        print('senza permessi:',e) 
+                                    except FileNotFoundError as e:
+                                        print('file non trovato:',e)
+                                    except Exception as e:
+                                        print('Errore disconosciuto:',e)   
+                                    except KeyError or NameError:
+                                        print('file non trovato')
+                        break
+                    else:
+                        finalrep = ''
+                # attilio : non ho capito come mai marcos gha messo un loop
+                for file_caricare in range(1): 
+                    if finalrep == '':
+                        print('- Attenzione -')
+                        print('File Final Rerpot da caricare non trovato o con nome sbagliato')
+                        Esito_caricamento_Genotipi='B'
+                        out = open(newctl,'w')
+                        with open(tmpctl,'r') as f:
+                            for line in f:
+                                if 'Esito_caricamento_Genotipi' in line:
+                                    line = "Esito_caricamento_Genotipi = '{Esito_caricamento_Genotipi}' # Codice per esiti di caricamento log\n".format(Esito_caricamento_Genotipi = Esito_caricamento_Genotipi)
+                                out.write(line)
+                        out.close()
+                        aggiorna_parametri()
+                        tabelle_cari()
+                        break
+                    else:
+                        print('file final da caricare trovato')
+                        tipo_chip=[]
+                        blocco = []
+                        verif_final_report = []
+                        File_Final_Report= []
+                        verif_esito_file_finale=[]
+                        camp = []
+                        for simbolo in P.lista_simbolo:
+                            if blocco != 'trovato_chip':
+                                sep = simbolo
+                                for en,line in enumerate(open(percorso_completo,'r')):
+                                    if blocco!= 'trovato_chip':
+                                        if line.startswith('Content'):
+                                            tipo_chip = line.strip().split(sep)
+                                        if len(tipo_chip)>1:
+                                            print('Nome di chip presenti in file Final Report')
+                                            blocco = 'trovato_chip'
+                                            t_chip=pd.DataFrame([tipo_chip])
+                                            if sep =='\t':
+                                                code_mappa1 = list(t_chip[2]) 
+                                            else:
+                                                code_mappa1 = list(t_chip[1])
+                                            code_mappa2 =''.join(map(str,code_mappa1))
+                                            CHIP_ALIAS = code_mappa2
+                                            chip = str(code_mappa2) 
+                                            Tipo_Chip=chip
+                                            Alias = 'SI'
+                                            # del(t_chip, code_mappa1, code_mappa2)
+                                            File_Final_Report = 'notmissing'  
+                                            n=0
+                                            for en,line in enumerate(open(percorso_completo,'r')):
+                                                if line.startswith('SNP Name'):
+                                                    h = line.strip().split(sep) 
+                                                    n=1
+                                                    if 'Allele1 - AB' in h and 'Allele2 - AB' in h:
+                                                        print('colonna Allele1 - AB trovato, colonna Allele2 - AB trovato')
+                                                    else:  
+                                                        File_Final_Report = 'missing'
+                                                        break
+                                                else:
+                                                    if n==1 and File_Final_Report != 'missing':
+                                                        File_Final_Report = 'notmissing'
+                                                        dati = line.strip().split(sep)
+                                                        camp.append([dati[h.index('Sample ID')],dati[h.index('SNP Name')]])
+                        tmp_finalreports = pd.DataFrame(camp, columns = ['Sample ID', 'SNP Name']) 
+                        if blocco == 'trovato_chip':
+                            if len(tipo_chip)<2:
+                                    print('esiste chip pero separator diverso da quelli presenti nell elenco dei parametri')
+                                    Esito_caricamento_Genotipi='A'
+                                    out = open(newctl,'w')
+                                    with open(tmpctl,'r') as f:
+                                        for line in f:
+                                            if 'Esito_caricamento_Genotipi' in line:
+                                                line = "Esito_caricamento_Genotipi = '{Esito_caricamento_Genotipi}' # Codice per esiti di caricamento log\n".format(Esito_caricamento_Genotipi = Esito_caricamento_Genotipi)
+                                            out.write(line)
+                                    out.close()
+                                    aggiorna_parametri()
+                                    tabelle_cari()
+                                    verif_final_report = 'errori'
+                                    break
+                            if File_Final_Report == 'missing': 
+                                print('ATTENZIONE: ---> file final reports con errori coluna mancante')
+                                code_errore()
+                                tabelle_cari()
+                                verif_final_report = 'errori'
+                                file_processato()
+                                break
+                            else: 
+                                freq=pd.DataFrame(tmp_finalreports.groupby(by='Sample ID').size())
+                                freq.reset_index(inplace=True)
+                                if max(freq[0]) != min(freq[0]):
+                                    print('ATTENZIONE: ---> file final reports con errori - numero snp')
+                                    code_errore()
+                                    tabelle_cari()
+                                    verif_final_report = 'errori'
+                                    file_processato()
+                                    break
+                                else:
+                                    print('ATTENZIONE: ---> file final reports senza errori')
+                                    chip = len(tmp_finalreports)/len(freq)
+                                    nsnp=int(chip)                                
+
+                        else:
+                            print('Nome di chip non presenti in file Final Report') 
+                            for simbolo in P.lista_simbolo:
+                                if blocco == 'trovato_separator' and len(camp)!=0:
+                                    # print(File_Final_Report)
+                                    continue
+                                n=0
+                                sep = simbolo
+                                for en,line in enumerate(open(percorso_completo,'r')):
+                                    if line.startswith('SNP Name'):
+                                        h = line.strip().split(sep) 
+                                        n=1
+                                        if 'Allele1 - AB' in h and 'Allele2 - AB' in h:
+                                            print('colonna Allele1 - AB trovato, colonna Allele2 - AB trovato')
+                                            blocco = 'trovato_separator'
+                                        else:  
+                                            File_Final_Report = 'missing'
+                                            break
+                                    else:
+                                        if n==1 and File_Final_Report != 'missing':
+                                            File_Final_Report = 'notmissing'
+                                            dati = line.strip().split(sep)
+                                            camp.append([dati[h.index('Sample ID')],dati[h.index('SNP Name')]])
+                        tmp_finalreports = pd.DataFrame(camp, columns=['Sample ID', 'SNP Name'])  
+                        for file_caricare in range(1):
+                            if blocco == 'trovato_separator':
+                                if File_Final_Report == 'missing': 
+                                    print('ATTENZIONE: ---> file final reports con errori coluna mancante')
+                                    code_errore()
+                                    tabelle_cari()
+                                    verif_final_report = 'errori'
+                                    break
+                                else: 
+                                    freq=pd.DataFrame(tmp_finalreports.groupby(by='Sample ID').size())
+                                    freq.reset_index(inplace=True)
+                                    if max(freq[0]) != min(freq[0]):
+                                        print('ATTENZIONE: ---> file final reports con errori - numero snp')
+                                        verif_final_report = 'errori'
+                                        break
+                                    else:
+                                        print('ATTENZIONE: ---> file final reports senza errori')
+                                        try:
+                                            chip = len(tmp_finalreports)/len(freq)
+                                            Tipo_Chip=int(chip)
+                                            Alias = 'NO'
+                                        except ZeroDivisionError: 
+                                            verif_final_report = 'errori'
+                                            break
+                        if verif_final_report =='errori':
+                            print('ATTENZIONE: ---> file final reports con errori - numero snp -fuori loop')
+                            code_errore()
+                            tabelle_cari()
+                            file_processato()
+                            break
+                        else:
+                            if File_Final_Report != 'missing' and verif_final_report != 'errori':
+                                if blocco == 'trovato_separator' or blocco == 'trovato_chip':
+                                    print('continuare procedura')
+                                    for ji in range(1):
+                                        print('inizio di controlle mappa')
+                                        Mappe = 'SELECT * FROM GEN.%s' % (P.Folder_Mappa)
+                                        cursor.execute(Mappe)
+                                        Mappa_Finalreport='missing_chip'
+                                        Aggiorna_Gen_Mappe='NO'
+                                        procedura_alias = ''
+                                        for row in cursor:
+                                            if Alias == 'SI':
+                                                # print('uso name alias')
+                                                if row.Map_Alias==Tipo_Chip:
+                                                    Mappa_Finalreport=row.Map_Name
+                                            elif Alias == 'NO':
+                                                    # print('uso numero snp')
+                                                    if row.Number_snp==Tipo_Chip:
+                                                        Mappa_Finalreport=row.Map_Name
+                                                    # print('aggiorna gen.mappe')
+                                        if Alias == 'SI' and Mappa_Finalreport=='missing_chip':
+                                            # print('name alias presenti, pero uso numero snp')
+                                            procedura_alias = 'CODE3' #'chip final report - chip non ALias'
+                                            Mappe = 'SELECT * FROM GEN.%s' % (P.Folder_Mappa)
+                                            cursor.execute(Mappe)
+                                            Mappa_Finalreport='missing_chip'
+                                            for row in cursor:
+                                                    if row.Number_snp==nsnp:
+                                                        Mappa_Finalreport=row.Map_Name
+                                            print('aggiorna gen.mappe')
+                                            if Mappa_Finalreport!='missing_chip':        
+                                                Aggiorna_Gen_Mappe='SI'
+                                                out = open(newctl,'w')
+                                                with open(tmpctl,'r') as f:
+                                                    for line in f:
+                                                        if 'Aggiorna_Gen_Mappe' in line:
+                                                            line = "Aggiorna_Gen_Mappe = '{Aggiorna_Gen_Mappe}' # Codice per esiti di caricamento log\n".format(Aggiorna_Gen_Mappe = Aggiorna_Gen_Mappe)
+                                                        out.write(line)
+                                                out.close()
+                                                aggiorna_parametri()
+                                        else:
+                                            out = open(newctl,'w')
+                                            with open(tmpctl,'r') as f:
+                                                for line in f:
+                                                    if 'Aggiorna_Gen_Mappe' in line:
+                                                        line = "Aggiorna_Gen_Mappe = '{Aggiorna_Gen_Mappe}' # Codice per esiti di caricamento log\n".format(Aggiorna_Gen_Mappe = Aggiorna_Gen_Mappe)
+                                                    out.write(line)
+                                            out.close()
+                                            aggiorna_parametri()
+                                        print('fine di controlle mappa')
+                                        if Mappa_Finalreport == 'missing_chip':
+                                            print('- Attenzione -')
+                                            print('--> Chip non presentì in Alias') 
+                                            print('----> Mappa Final report con numero di SNP diverso di una già caricata')
+                                            print('----> Necessario caricare una nuova mappa')
+                                            Esito_caricamento_Genotipi='C'
+                                            out = open(newctl,'w')
+                                            with open(tmpctl,'r') as f:
+                                                for line in f:
+                                                    if 'Esito_caricamento_Genotipi' in line:
+                                                        line = "Esito_caricamento_Genotipi = '{Esito_caricamento_Genotipi}' # Codice per esiti di caricamento log\n".format(Esito_caricamento_Genotipi = Esito_caricamento_Genotipi)
+                                                    out.write(line)
+                                            out.close()
+                                            aggiorna_parametri()
+                                            file_processato()
+                                            tabelle_cari()
+                                            break
+                                        else:
+                                            tableSNP = 'SELECT SNP_Name FROM GEN.[%s]' % (Mappa_Finalreport)
+                                            snp_map = pd.read_sql(tableSNP,conn)
+                                            snp_map.rename(columns={'SNP_Name':'SNP Name'},inplace=True)
+                                            if not snp_map.empty:#TODO
+                                                print('- Attenzione -')
+                                                tmp_finalreports = tmp_finalreports.drop_duplicates(['SNP Name'])  
+                                                tmp_finalreports.reset_index(inplace=True,drop=True)
+                                                controlle = pd.merge(tmp_finalreports,snp_map,on='SNP Name', how="outer")
+                                                if len(controlle)==len(tmp_finalreports) and len(controlle)==len(snp_map):
+                                                    print('----> Mappa Final Report coincide con la mappa già caricata')
+                                                    print('------> Converto final reports in string')
+                                                    out = open(newctl,'w')
+                                                    with open(tmpctl,'r') as f:
+                                                        for line in f:
+                                                            if 'Final_Reports' in line:
+                                                                line = "Final_Reports = '{Nome_File}' # File final report da usare in programma genotipi final report\n".format(Nome_File = Nome_File)
+                                                            if 'Tipo_Chip' in line:
+                                                                line = "Tipo_Chip = '{Tipo_Chip}' # Nome chip da usare in programma genotipi final report\n".format(Tipo_Chip = Tipo_Chip)
+                                                            if 'Alias' in line:
+                                                                line = "Alias = '{Alias}' # Nome chip da usare in programma genotipi final report\n".format(Alias = Alias)
+                                                            if 'Mappa_Finalreport' in line:
+                                                                line = "Mappa_Finalreport = '{Mappa_Finalreport}' # Nome chip da usare in programma genotipi final report\n".format(Mappa_Finalreport = Mappa_Finalreport)
+                                                            if 'Id_genotipe' in line:
+                                                                line = "Id_genotipe = '{Id_genotipe}' # Identificatore da usare su programma genotipe\n".format(Id_genotipe = Nume_Cari)                                              
+                                                            out.write(line)
+                                                    print('--------> Aggiorno parametri.py per procedura genotipe')
+                                                    out.close()
+                                                    aggiorna_parametri()
+                                                    del(Nome_File, Tipo_Chip, out, chip, simbolo,  dimensione, diretorios, en, ext_file, file, file_ricerca, files, line, nome_file, raiz, sep, tipo_chip, tmp_finalreports)
+                                                    for geno_mappe in range(1):
+                                                        scripts = ['programma_genotipi.py','programma_genotipi_parentela.py']
+                                                        processos = []
+                                                        for script in scripts:
+                                                            processo = subprocess.Popen([sys.executable, script])
+                                                            processos.append(processo)
+                                                        for processo in processos:
+                                                            processo.wait() 
+                                                    print('----------> Finito procedura programma_genotipi.py e programma_genotipi_parentela.py')
+                                                    file_finale_genotipi = P.path_output+P.Final_Reports
+                                                    dataset_genotipi = open(file_finale_genotipi,'r')
+                                                    lista_genotipi = dataset_genotipi.readlines() 
+                                                    file_finale_parentela = P.path_output+P.Final_Reports+P.Folder_Verif
+                                                    dataset_parentela = open(file_finale_parentela,'r')
+                                                    lista_parentela = dataset_parentela.readlines() 
+                                                    dataset_genotipi.close()
+                                                    dataset_parentela.close()
+                                                    if len(lista_genotipi) == (len(freq)+1) and len(lista_parentela) == (len(freq)+1):
+                                                        print('Finito giro string')
+                                                        genotipe_string= pd.read_csv(file_finale_genotipi,sep=';',header=0)
+                                                        parentela_string= pd.read_csv(file_finale_parentela,sep=';',header=0)
+                                                        genotipe_string.rename(columns={'CallRate':'CallRate_G','mappa_usata':'Mappa_usata_G'},inplace=True)
+                                                        parentela_string.rename(columns={'Genotipo':'Genotipo_parentela'},inplace=True)
+                                                        file_finale_caricare = pd.merge(genotipe_string,parentela_string, on = 'Campione',how='inner')
+                                                        file_finale_caricare['Nume_Cari']= Nume_Cari
+                                                        cols=['Nume_Cari','Campione','CallRate_G','Mappa_usata_G','Genotipo_parentela','Genotipo']    
+                                                        file_finale_caricare=file_finale_caricare[cols]                                                        
+                                                        cursor.fast_executemany = True
+                                                        passmappe_sql = "INSERT INTO GEN.[Tmp_FinalRerport] (Nume_Cari,Campione,CallRate_G,Mappa_usata_G,Genotipo_parentela,Genotipo) values(?,?,?,?,?,?)"   
+                                                        cursor.executemany(passmappe_sql,file_finale_caricare.values.tolist())     
+                                                        conn.commit()
+                                                        file_processato()
+                                                        tabelle_cari()
+                                                        Esito_caricamento_Genotipi='F'
+                                                        out = open(newctl,'w')
+                                                        with open(tmpctl,'r') as f:
+                                                            for line in f:
+                                                                if 'Esito_caricamento_Genotipi' in line:
+                                                                    line = "Esito_caricamento_Genotipi = '{Esito_caricamento_Genotipi}' # Codice per esiti di caricamento log\n".format(Esito_caricamento_Genotipi = Esito_caricamento_Genotipi)
+                                                                out.write(line)
+                                                        out.close()
+                                                        aggiorna_parametri()
+                                                        if Aggiorna_Gen_Mappe == 'SI':
+                                                            Map_Alias=''                                                           
+                                                            if Alias == 'SI' and procedura_alias != 'CODE3':
+                                                                print('--> Nome chip da aggiorna ALias = ' + CHIP_ALIAS)
+                                                                Map_Alias=CHIP_ALIAS
+                                                            elif Alias == 'SI' and procedura_alias == 'CODE3':
+                                                                print('--> Nome chip da aggiorna ALias = ' + CHIP_ALIAS)
+                                                                Map_Alias=CHIP_ALIAS
+                                                            else:
+                                                                print('--> Nome chip da aggiorna ALias = ' + P.Tipo_Chip)
+                                                                Map_Alias=P.Tipo_Chip
+                                                            Map_Name=str(nsnp)+'_a'
+                                                            Number_snp=nsnp
+                                                            valore=[Nume_Cari,str(Map_Name),Number_snp,str(Map_Alias)]
+                                                            cursor.execute("INSERT INTO GEN.[Tmp_Record_Mappe] (Nume_Cari,Map_Name,Number_snp,Map_Alias) values(?,?,?,?)",valore)
+                                                            conn.commit()
+                                                            #%%
+                                                            Esito_caricamento_Genotipi='G'
+                                                            out = open(newctl,'w')
+                                                            with open(tmpctl,'r') as f:
+                                                                for line in f:
+                                                                    if 'Esito_caricamento_Genotipi' in line:
+                                                                        line = "Esito_caricamento_Genotipi = '{Esito_caricamento_Genotipi}' # Codice per esiti di caricamento log\n".format(Esito_caricamento_Genotipi = Esito_caricamento_Genotipi)
+                                                                    out.write(line)
+                                                            out.close()
+                                                            aggiorna_parametri()
+                                                            print('andato buon fine')
+                                                    else:
+                                                        print('loop di ultimo controle')
+                                                        print('ATTENZIONE: ---> Numero campione minore delle file Final report originale')
+                                                        Esito_caricamento_Genotipi='E'
+                                                        out = open(newctl,'w')
+                                                        with open(tmpctl,'r') as f:
+                                                            for line in f:
+                                                                if 'Esito_caricamento_Genotipi' in line:
+                                                                    line = "Esito_caricamento_Genotipi = '{Esito_caricamento_Genotipi}' # Codice per esiti di caricamento log\n".format(Esito_caricamento_Genotipi = Esito_caricamento_Genotipi)
+                                                                out.write(line)
+                                                        out.close()
+                                                        aggiorna_parametri()
+                                                        file_processato()
+                                                        tabelle_cari()
+                                                        print('break')
+                                                        break 
+                                                else:
+                                                    print('----> Mappa Final Report non coincide con la mappa già caricata')
+                                                    print('------> Blocco caricamento')
+                                                    Esito_caricamento_Genotipi='C'
+                                                    out = open(newctl,'w')
+                                                    with open(tmpctl,'r') as f:
+                                                        for line in f:
+                                                            if 'Esito_caricamento_Genotipi' in line:
+                                                                line = "Esito_caricamento_Genotipi = '{Esito_caricamento_Genotipi}' # Codice per esiti di caricamento log\n".format(Esito_caricamento_Genotipi = Esito_caricamento_Genotipi)
+                                                            out.write(line)
+                                                    out.close()
+                                                    aggiorna_parametri()
+                                                    file_processato()
+                                                    tabelle_cari()
+                                                    break 
+            print('FINO LOOP SECUNDARIO  '+str(sec))
+            print('caricamento tabella log  '+str(id),str(Tipo_cari))
+            for geno_mappe in range(1):
+                print('inizio-programma_caricare_log.py')
+                script = 'programma_caricare_log.py'
+                processos = []
+                processo = subprocess.Popen([sys.executable, script])
+                processo.wait()
+                print('fine-programma_caricare_log.py')
+        print('end ultimo controle')
+    print('FINO LOOP PRINCIPALE  '+str(sec))
